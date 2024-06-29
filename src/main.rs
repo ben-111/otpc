@@ -1,9 +1,40 @@
+use base64::{engine::general_purpose, Engine as _};
 use clap::{Parser, Subcommand};
+use dialoguer;
 use homedir;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use simple_crypt::{decrypt, encrypt};
+use totp_rs::TOTP;
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, error::Error, path::PathBuf};
+
+use std::fmt;
+
+#[derive(Debug)]
+struct OTPCError {
+    details: String,
+}
+
+impl OTPCError {
+    fn new(msg: &str) -> OTPCError {
+        OTPCError {
+            details: msg.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for OTPCError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.details)
+    }
+}
+
+impl Error for OTPCError {
+    fn description(&self) -> &str {
+        &self.details
+    }
+}
 
 /// Simple TOTP client
 #[derive(Parser)]
@@ -16,13 +47,22 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Add a TOTP secret with a name
+    /// Add a TOTP secret
     Add {
         /// Name of the TOTP secret
         name: String,
 
-        /// The secret encoded in base32 or as an otpauth URL
+        /// The secret as an otpauth URL
         secret: String,
+    },
+
+    /// List all TOTP secrets
+    List,
+
+    /// Get the current TOTP value of a secret
+    Get {
+        /// Name of the TOTP secret
+        name: String,
     },
 }
 
@@ -61,16 +101,76 @@ fn write_config(config: &Config) {
     serde_json::to_writer(std::fs::File::create(config_file).unwrap(), config).unwrap();
 }
 
-fn main() {
+fn get_password() -> String {
+    return dialoguer::Password::new()
+        .with_prompt("Enter password")
+        .interact()
+        .unwrap();
+}
+
+fn add_secret(config: &mut Config, name: &String, secret: &String) -> Result<(), OTPCError> {
+    println!("Adding secret {:?} to entry {}", secret, name);
+    if config.secrets.contains_key(name) {
+        let overwrite = dialoguer::Confirm::new()
+            .with_prompt("A secret exists with that name. Overwrite?")
+            .interact()
+            .unwrap();
+        if !overwrite {
+            return Ok(());
+        }
+    }
+    let password = get_password();
+    let encrypted_bytes = encrypt(secret.as_bytes(), password.as_bytes()).unwrap();
+    let encoded_secret = general_purpose::STANDARD.encode(&encrypted_bytes);
+
+    config.secrets.insert(name.clone(), encoded_secret);
+    write_config(&config);
+    Ok(())
+}
+
+fn list_secrets(config: &Config) -> Result<(), OTPCError> {
+    config.secrets.keys().for_each(|name| println!("{}", name));
+    Ok(())
+}
+
+fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
+    match config.secrets.get(name) {
+        Some(secret) => {
+            let decoded = general_purpose::STANDARD.decode(&secret).unwrap();
+            let password = get_password();
+            match decrypt(&decoded, password.as_bytes()) {
+                Ok(decrypted) => {
+                    let secret = String::from_utf8(decrypted).unwrap();
+
+                    match TOTP::from_url(secret) {
+                        Ok(totp) => {
+                            println!(
+                                "{} TTL: {}",
+                                totp.generate_current().unwrap(),
+                                totp.ttl().unwrap()
+                            );
+                            return Ok(());
+                        }
+                        Err(_) => return Err(OTPCError::new("Error generating TOTP code")),
+                    }
+                }
+                Err(_) => return Err(OTPCError::new("Wrong password")),
+            }
+        }
+        None => {
+            return Err(OTPCError::new("Secret not found"));
+        }
+    }
+}
+
+fn main() -> Result<(), OTPCError> {
     let args = Args::parse();
 
     let mut config = read_config();
 
     match &args.command {
-        Commands::Add { name, secret } => {
-            println!("Adding secret {:?} to entry {}", secret, name);
-            config.secrets.insert(name.clone(), secret.clone());
-            write_config(&config);
-        }
+        Commands::Add { name, secret } => return add_secret(&mut config, name, secret),
+        Commands::List => return list_secrets(&config),
+        Commands::Get { name } => return get_totp(&config, &name),
     }
 }
