@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Parser, Subcommand};
 use dialoguer;
+use google_authenticator_converter::{self, Account};
 use homedir;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -64,6 +65,12 @@ enum Commands {
         /// Name of the TOTP secret
         name: String,
     },
+
+    /// Import TOTP secrets from Google Authenticator
+    Import {
+        /// otpauth-migration URL
+        url: String,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -75,7 +82,7 @@ fn get_config_path() -> PathBuf {
     let homedir = homedir::get_my_home().unwrap().unwrap();
     let appdir = homedir.as_path().join(".otpc");
     if std::fs::metadata(&appdir).is_err() {
-        std::fs::create_dir(&appdir).expect("Failed creating .otpc directory");
+        std::fs::create_dir(&appdir).expect("Failed creating .otpc directory: {}");
     }
 
     let config_path = appdir.join("config.json");
@@ -108,6 +115,13 @@ fn get_password() -> String {
         .unwrap();
 }
 
+fn add_otpauth_to_config(config: &mut Config, name: &String, secret: &String, password: &String) {
+    let encrypted_bytes = encrypt(secret.as_bytes(), password.as_bytes()).unwrap();
+    let encoded_secret = general_purpose::STANDARD.encode(&encrypted_bytes);
+
+    config.secrets.insert(name.clone(), encoded_secret);
+}
+
 fn add_secret(config: &mut Config, name: &String, secret: &String) -> Result<(), OTPCError> {
     println!("Adding secret {:?} to entry {}", secret, name);
     if config.secrets.contains_key(name) {
@@ -120,10 +134,7 @@ fn add_secret(config: &mut Config, name: &String, secret: &String) -> Result<(),
         }
     }
     let password = get_password();
-    let encrypted_bytes = encrypt(secret.as_bytes(), password.as_bytes()).unwrap();
-    let encoded_secret = general_purpose::STANDARD.encode(&encrypted_bytes);
-
-    config.secrets.insert(name.clone(), encoded_secret);
+    add_otpauth_to_config(config, name, secret, &password);
     write_config(&config);
     Ok(())
 }
@@ -151,7 +162,12 @@ fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
                             );
                             return Ok(());
                         }
-                        Err(_) => return Err(OTPCError::new("Error generating TOTP code")),
+                        Err(e) => {
+                            return Err(OTPCError::new(&format!(
+                                "Error generating TOTP code: {}",
+                                e.to_string(),
+                            )))
+                        }
                     }
                 }
                 Err(_) => return Err(OTPCError::new("Wrong password")),
@@ -160,6 +176,30 @@ fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
         None => {
             return Err(OTPCError::new("Secret not found"));
         }
+    }
+}
+
+fn account_to_otpauth_url(account: &Account) -> String {
+    return format!(
+        "otpauth://totp/{}?secret={}&issuer={}",
+        account.name, account.secret, account.issuer
+    );
+}
+
+fn import_from_google_auth(config: &mut Config, migration_url: &String) -> Result<(), OTPCError> {
+    match google_authenticator_converter::process_data(&migration_url) {
+        Ok(accounts) => {
+            let password = get_password();
+            for account in accounts {
+                let secret = account_to_otpauth_url(&account);
+                println!("{}", secret);
+                add_otpauth_to_config(config, &account.issuer, &secret, &password);
+            }
+
+            write_config(config);
+            Ok(())
+        }
+        Err(_) => Err(OTPCError::new("Error parsing migration URL")),
     }
 }
 
@@ -172,5 +212,6 @@ fn main() -> Result<(), OTPCError> {
         Commands::Add { name, secret } => return add_secret(&mut config, name, secret),
         Commands::List => return list_secrets(&config),
         Commands::Get { name } => return get_totp(&config, &name),
+        Commands::Import { url } => return import_from_google_auth(&mut config, url),
     }
 }
