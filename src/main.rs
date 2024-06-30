@@ -71,6 +71,12 @@ enum Commands {
         /// otpauth-migration URL
         url: String,
     },
+
+    /// Delete TOTP secret
+    Delete {
+        /// Name of the TOTP secret
+        name: String,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -203,6 +209,14 @@ fn import_from_google_auth(config: &mut Config, migration_url: &String) -> Resul
     }
 }
 
+fn delete_secret(config: &mut Config, name: &String) -> Result<(), OTPCError> {
+    if config.secrets.remove(name).is_none() {
+        return Err(OTPCError::new("Secret not found"));
+    }
+    write_config(config);
+    Ok(())
+}
+
 fn main() -> Result<(), OTPCError> {
     let args = Args::parse();
 
@@ -213,5 +227,6 @@ fn main() -> Result<(), OTPCError> {
         Commands::List => return list_secrets(&config),
         Commands::Get { name } => return get_totp(&config, &name),
         Commands::Import { url } => return import_from_google_auth(&mut config, url),
+        Commands::Delete { name } => return delete_secret(&mut config, name),
     }
 }
