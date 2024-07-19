@@ -8,9 +8,10 @@ use serde_json;
 use simple_crypt::{decrypt, encrypt};
 use totp_rs::TOTP;
 
+use std::io::Write;
 use std::{collections::HashMap, error::Error, path::PathBuf};
 
-use std::fmt;
+use std::{fmt, io, time};
 
 #[derive(Debug)]
 struct OTPCError {
@@ -161,12 +162,16 @@ fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
 
                     match TOTP::from_url(secret) {
                         Ok(totp) => {
-                            println!(
-                                "{} TTL: {}",
-                                totp.generate_current().unwrap(),
-                                totp.ttl().unwrap()
-                            );
-                            return Ok(());
+                            loop {
+                                print!(
+                                    "\x1b[2K\r{} TTL: {}",
+                                    totp.generate_current().unwrap(),
+                                    totp.ttl().unwrap()
+                                );
+                                io::stdout().flush().unwrap();
+                                std::thread::sleep(time::Duration::from_secs_f32(1.0));
+                            }
+                            //return Ok(());
                         }
                         Err(e) => {
                             return Err(OTPCError::new(&format!(
