@@ -8,6 +8,7 @@ use serde_json;
 use simple_crypt::{decrypt, encrypt};
 use totp_rs::TOTP;
 
+use itertools::Itertools;
 use std::io::Write;
 use std::{collections::HashMap, error::Error, path::PathBuf};
 
@@ -147,7 +148,11 @@ fn add_secret(config: &mut Config, name: &String, secret: &String) -> Result<(),
 }
 
 fn list_secrets(config: &Config) -> Result<(), OTPCError> {
-    config.secrets.keys().for_each(|name| println!("{}", name));
+    config
+        .secrets
+        .keys()
+        .sorted()
+        .for_each(|name| println!("{}", name));
     Ok(())
 }
 
@@ -161,18 +166,15 @@ fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
                     let secret = String::from_utf8(decrypted).unwrap();
 
                     match TOTP::from_url(secret) {
-                        Ok(totp) => {
-                            loop {
-                                print!(
-                                    "\x1b[2K\r{} TTL: {}",
-                                    totp.generate_current().unwrap(),
-                                    totp.ttl().unwrap()
-                                );
-                                io::stdout().flush().unwrap();
-                                std::thread::sleep(time::Duration::from_secs_f32(1.0));
-                            }
-                            //return Ok(());
-                        }
+                        Ok(totp) => loop {
+                            print!(
+                                "\x1b[2K\r{} TTL: {}",
+                                totp.generate_current().unwrap(),
+                                totp.ttl().unwrap()
+                            );
+                            io::stdout().flush().unwrap();
+                            std::thread::sleep(time::Duration::from_secs_f32(1.0));
+                        },
                         Err(e) => {
                             return Err(OTPCError::new(&format!(
                                 "Error generating TOTP code: {}",
