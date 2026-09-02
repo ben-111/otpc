@@ -1,54 +1,69 @@
+mod tui;
+
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
 use google_authenticator_converter::{self, Account};
-use itertools::Itertools;
 use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::{self, Write};
 use std::path::Path;
-use std::time;
 use totp_rs::TOTP;
 
 const KEYRING_SERVICE: &str = "otpc";
 const KEYRING_USER: &str = "totp-secrets";
+const FIRST_CREDENTIAL_ID: u64 = 1;
 
-/// Simple TOTP client
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
-#[command(propagate_version = true)]
-struct Args {
-    #[command(subcommand)]
-    command: Commands,
+#[derive(Clone, Deserialize, Serialize)]
+struct Credential {
+    id: u64,
+    issuer: String,
+    name: String,
+    url: String,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Add TOTP secrets from a URL or QR code image
-    Add {
-        /// An otpauth URL, otpauth-migration URL, or QR code image path
-        source: String,
-    },
-
-    /// List all TOTP secrets
-    List,
-
-    /// Get the current TOTP value of a secret
-    Get {
-        /// Name of the TOTP secret
-        name: String,
-    },
-
-    /// Delete TOTP secret
-    Delete {
-        /// Name of the TOTP secret
-        name: String,
-    },
-}
-
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Config {
-    secrets: HashMap<String, String>,
+    next_id: u64,
+    credentials: Vec<Credential>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            next_id: FIRST_CREDENTIAL_ID,
+            credentials: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NewCredential {
+    issuer: String,
+    name: String,
+    url: String,
+}
+
+impl Config {
+    fn add(&mut self, credentials: Vec<NewCredential>) -> Result<usize> {
+        if credentials.is_empty() {
+            anyhow::bail!("No credentials found");
+        }
+
+        let count = credentials.len();
+        let next_id = self
+            .next_id
+            .checked_add(count as u64)
+            .context("Credential ID limit reached")?;
+
+        for (offset, credential) in credentials.into_iter().enumerate() {
+            self.credentials.push(Credential {
+                id: self.next_id + offset as u64,
+                issuer: credential.issuer,
+                name: credential.name,
+                url: credential.url,
+            });
+        }
+        self.next_id = next_id;
+        Ok(count)
+    }
 }
 
 fn read_config(entry: &Entry) -> Result<Config> {
@@ -68,26 +83,16 @@ fn write_config(entry: &Entry, config: &Config) -> Result<()> {
         .context("Failed to save config to keyring")
 }
 
-fn add_otpauth_to_config(config: &mut Config, name: &str, secret: &str) {
-    config.secrets.insert(name.to_owned(), secret.to_owned());
+fn account_to_otpauth_url(account: &Account) -> String {
+    let issuer = urlencoding::encode(&account.issuer);
+    let name = urlencoding::encode(&account.name);
+    format!(
+        "otpauth://totp/{}:{}?secret={}&issuer={}",
+        issuer, name, account.secret, issuer
+    )
 }
 
-fn add_secret(config: &mut Config, name: &str, secret: &str) -> Result<bool> {
-    if config.secrets.contains_key(name) {
-        let overwrite = dialoguer::Confirm::new()
-            .with_prompt("A secret exists with that name. Overwrite?")
-            .interact()
-            .context("Failed to read confirmation")?;
-        if !overwrite {
-            return Ok(false);
-        }
-    }
-
-    add_otpauth_to_config(config, name, secret);
-    Ok(true)
-}
-
-fn secrets_from_url(url: &str) -> Result<Vec<(String, String)>> {
+fn credentials_from_url(url: &str) -> Result<Vec<NewCredential>> {
     if url.starts_with("otpauth-migration://") {
         let accounts = google_authenticator_converter::process_data(url)
             .map_err(|_| anyhow::anyhow!("Error parsing otpauth-migration URL"))?;
@@ -98,16 +103,27 @@ fn secrets_from_url(url: &str) -> Result<Vec<(String, String)>> {
                 if account.issuer.is_empty() {
                     anyhow::bail!("TOTP account is missing an issuer");
                 }
-
                 let url = account_to_otpauth_url(&account);
-                Ok((account.issuer, url))
+                Ok(NewCredential {
+                    issuer: account.issuer,
+                    name: account.name,
+                    url,
+                })
             })
             .collect();
     }
 
     let totp = TOTP::from_url_unchecked(url).context("Error parsing otpauth URL")?;
     let issuer = totp.issuer.context("TOTP URL is missing an issuer")?;
-    Ok(vec![(issuer, url.to_owned())])
+    if totp.account_name.is_empty() {
+        anyhow::bail!("TOTP URL is missing an account name");
+    }
+
+    Ok(vec![NewCredential {
+        issuer,
+        name: totp.account_name,
+        url: url.to_owned(),
+    }])
 }
 
 fn url_from_qr_image(path: &Path) -> Result<String> {
@@ -127,84 +143,54 @@ fn url_from_qr_image(path: &Path) -> Result<String> {
     Ok(content.trim().to_owned())
 }
 
-fn secrets_from_source(source: &str) -> Result<Vec<(String, String)>> {
+fn credentials_from_source(source: &str) -> Result<Vec<NewCredential>> {
     let url = if source.starts_with("otpauth://") || source.starts_with("otpauth-migration://") {
         source.to_owned()
     } else {
         url_from_qr_image(Path::new(source))?
     };
 
-    secrets_from_url(&url)
-}
-
-fn add_from_source(config: &mut Config, source: &str) -> Result<bool> {
-    let mut config_changed = false;
-
-    for (issuer, secret) in secrets_from_source(source)? {
-        config_changed |= add_secret(config, &issuer, &secret)?;
-    }
-
-    Ok(config_changed)
-}
-
-fn list_secrets(config: &Config) {
-    config
-        .secrets
-        .keys()
-        .sorted()
-        .for_each(|name| println!("{}", name));
-}
-
-fn get_totp(config: &Config, name: &str) -> Result<()> {
-    let secret = config.secrets.get(name).context("Secret not found")?;
-    let totp = TOTP::from_url_unchecked(secret).context("Error generating TOTP code")?;
-
-    loop {
-        print!(
-            "\x1b[2K\r{} TTL: {}",
-            totp.generate_current()
-                .context("Failed to generate TOTP code")?,
-            totp.ttl().context("Failed to calculate TOTP TTL")?
-        );
-        io::stdout().flush().context("Failed to write TOTP code")?;
-        std::thread::sleep(time::Duration::from_secs(1));
-    }
-}
-
-fn account_to_otpauth_url(account: &Account) -> String {
-    format!(
-        "otpauth://totp/{}?secret={}&issuer={}",
-        account.name, account.secret, account.issuer
-    )
-}
-
-fn delete_secret(config: &mut Config, name: &str) -> Result<()> {
-    config.secrets.remove(name).context("Secret not found")?;
-    Ok(())
+    credentials_from_url(&url)
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
     let entry =
         Entry::new(KEYRING_SERVICE, KEYRING_USER).context("Failed to initialize keyring entry")?;
-    let mut config = read_config(&entry)?;
+    let config = read_config(&entry)?;
+    tui::run(&entry, config)
+}
 
-    let config_changed = match &args.command {
-        Commands::Add { source } => add_from_source(&mut config, source)?,
-        Commands::List => {
-            list_secrets(&config);
-            false
-        }
-        Commands::Get { name } => return get_totp(&config, name),
-        Commands::Delete { name } => {
-            delete_secret(&mut config, name)?;
-            true
-        }
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if config_changed {
-        write_config(&entry, &config)?;
+    #[test]
+    fn parses_an_otpauth_credential() {
+        let url = "otpauth://totp/GitHub:user%40example.com?secret=KRSXG5CTMVRXEZLUKN2XAZLSKNSWG4TFOQ&issuer=GitHub";
+        let credentials = credentials_from_url(url).unwrap();
+
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].issuer, "GitHub");
+        assert_eq!(credentials[0].name, "user@example.com");
+        assert_eq!(credentials[0].url, url);
     }
 
-    Ok(())
+    #[test]
+    fn deleted_ids_are_not_reused() {
+        let mut config = Config {
+            next_id: 4,
+            credentials: Vec::new(),
+        };
+
+        config
+            .add(vec![NewCredential {
+                issuer: "Example".to_owned(),
+                name: "alice".to_owned(),
+                url: "url".to_owned(),
+            }])
+            .unwrap();
+
+        assert_eq!(config.credentials[0].id, 4);
+        assert_eq!(config.next_id, 5);
+    }
 }
