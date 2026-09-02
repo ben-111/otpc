@@ -127,20 +127,14 @@ fn credentials_from_url(url: &str) -> Result<Vec<NewCredential>> {
 }
 
 fn url_from_qr_image(path: &Path) -> Result<String> {
-    let image = image::open(path)
-        .with_context(|| format!("Failed to open QR code image {}", path.display()))?
-        .into_luma8();
-    let mut image = rqrr::PreparedImage::prepare(image);
-    let grid = image
-        .detect_grids()
-        .into_iter()
-        .next()
-        .with_context(|| format!("No QR code found in image {}", path.display()))?;
-    let (_, content) = grid
-        .decode()
-        .with_context(|| format!("Failed to decode QR code in image {}", path.display()))?;
+    let path_string = path
+        .to_str()
+        .with_context(|| format!("Image path is not valid UTF-8: {}", path.display()))?;
+    let result =
+        rxing::helpers::detect_in_file(path_string, Some(rxing::BarcodeFormat::QR_CODE))
+            .with_context(|| format!("Failed to decode QR code in image {}", path.display()))?;
 
-    Ok(content.trim().to_owned())
+    Ok(result.getText().trim().to_owned())
 }
 
 fn credentials_from_source(source: &str) -> Result<Vec<NewCredential>> {
