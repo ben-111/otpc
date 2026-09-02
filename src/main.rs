@@ -6,6 +6,7 @@ use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::Path;
 use std::time;
 use totp_rs::TOTP;
 
@@ -23,10 +24,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Add TOTP secrets from an otpauth or otpauth-migration URL
+    /// Add TOTP secrets from a URL or QR code image
     Add {
-        /// An otpauth or otpauth-migration URL
-        url: String,
+        /// An otpauth URL, otpauth-migration URL, or QR code image path
+        source: String,
     },
 
     /// List all TOTP secrets
@@ -109,10 +110,37 @@ fn secrets_from_url(url: &str) -> Result<Vec<(String, String)>> {
     Ok(vec![(issuer, url.to_owned())])
 }
 
-fn add_from_url(config: &mut Config, url: &str) -> Result<bool> {
+fn url_from_qr_image(path: &Path) -> Result<String> {
+    let image = image::open(path)
+        .with_context(|| format!("Failed to open QR code image {}", path.display()))?
+        .into_luma8();
+    let mut image = rqrr::PreparedImage::prepare(image);
+    let grid = image
+        .detect_grids()
+        .into_iter()
+        .next()
+        .with_context(|| format!("No QR code found in image {}", path.display()))?;
+    let (_, content) = grid
+        .decode()
+        .with_context(|| format!("Failed to decode QR code in image {}", path.display()))?;
+
+    Ok(content.trim().to_owned())
+}
+
+fn secrets_from_source(source: &str) -> Result<Vec<(String, String)>> {
+    let url = if source.starts_with("otpauth://") || source.starts_with("otpauth-migration://") {
+        source.to_owned()
+    } else {
+        url_from_qr_image(Path::new(source))?
+    };
+
+    secrets_from_url(&url)
+}
+
+fn add_from_source(config: &mut Config, source: &str) -> Result<bool> {
     let mut config_changed = false;
 
-    for (issuer, secret) in secrets_from_url(url)? {
+    for (issuer, secret) in secrets_from_source(source)? {
         config_changed |= add_secret(config, &issuer, &secret)?;
     }
 
@@ -162,7 +190,7 @@ fn main() -> Result<()> {
     let mut config = read_config(&entry)?;
 
     let config_changed = match &args.command {
-        Commands::Add { url } => add_from_url(&mut config, url)?,
+        Commands::Add { source } => add_from_source(&mut config, source)?,
         Commands::List => {
             list_secrets(&config);
             false
