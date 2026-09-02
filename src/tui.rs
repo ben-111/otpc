@@ -284,8 +284,8 @@ fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
     }
 
     let header = match (&app.mode, &app.message) {
-        (Mode::Normal, _) | (_, None) => "q quit | n add".to_owned(),
-        (_, Some(message)) => format!("q quit | n add | {message}"),
+        (Mode::Normal, _) | (_, None) => "OTPC | q quit | n add".to_owned(),
+        (_, Some(message)) => format!("OTPC | q quit | n add | {message}"),
     };
     queue!(
         stdout,
@@ -294,19 +294,26 @@ fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
         Print(fit_line(&header, width)),
         SetAttribute(Attribute::Reset)
     )?;
+    if height > 1 {
+        queue!(
+            stdout,
+            MoveTo(0, 1),
+            Print(std::iter::repeat_n('─', width as usize).collect::<String>())
+        )?;
+    }
 
-    let body_height = height.saturating_sub(2) as usize;
-    let visible_count = (body_height / 2).max(1);
+    let body_height = height.saturating_sub(3) as usize;
+    let visible_count = ((body_height + 1) / 3).max(1);
     if app.selected < app.scroll {
         app.scroll = app.selected;
     } else if app.selected >= app.scroll + visible_count {
         app.scroll = app.selected + 1 - visible_count;
     }
 
-    if app.config.credentials.is_empty() && height > 2 {
+    if app.config.credentials.is_empty() && height > 3 {
         queue!(
             stdout,
-            MoveTo(0, 1),
+            MoveTo(0, 2),
             Print(fit_line("No credentials. Press n to add one.", width))
         )?;
     } else {
@@ -319,7 +326,7 @@ fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
             .take(visible_count)
             .enumerate()
         {
-            let row = 1 + (slot * 2) as u16;
+            let row = 2 + (slot * 3) as u16;
             if row >= height.saturating_sub(1) {
                 break;
             }
@@ -328,11 +335,13 @@ fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
             }
             queue!(
                 stdout,
+                SetAttribute(Attribute::Bold),
                 MoveTo(0, row),
                 Print(fit_line(
                     &format!("{}: {}", credential.issuer, credential.name),
                     width
-                ))
+                )),
+                SetAttribute(Attribute::NormalIntensity)
             )?;
             if row + 1 < height.saturating_sub(1) {
                 queue!(
