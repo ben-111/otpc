@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use google_authenticator_converter::{self, Account};
 use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use totp_rs::TOTP;
 
 const KEYRING_SERVICE: &str = "otpc";
@@ -137,11 +137,27 @@ fn url_from_qr_image(path: &Path) -> Result<String> {
     Ok(result.getText().trim().to_owned())
 }
 
+fn expand_home(path: &Path) -> Result<PathBuf> {
+    if path.strip_prefix("~").is_err() {
+        return Ok(path.to_owned());
+    }
+    let home = homedir::get_my_home()
+        .context("Failed to determine home directory")?
+        .context("Home directory not found")?;
+    Ok(expand_home_from(path, &home))
+}
+
+fn expand_home_from(path: &Path, home: &Path) -> PathBuf {
+    path.strip_prefix("~")
+        .map(|suffix| home.join(suffix))
+        .unwrap_or_else(|_| path.to_owned())
+}
+
 fn credentials_from_source(source: &str) -> Result<Vec<NewCredential>> {
     let url = if source.starts_with("otpauth://") || source.starts_with("otpauth-migration://") {
         source.to_owned()
     } else {
-        url_from_qr_image(Path::new(source))?
+        url_from_qr_image(&expand_home(Path::new(source))?)?
     };
 
     credentials_from_url(&url)
@@ -186,5 +202,19 @@ mod tests {
 
         assert_eq!(config.credentials[0].id, 4);
         assert_eq!(config.next_id, 5);
+    }
+
+    #[test]
+    fn expands_a_leading_tilde_path_component() {
+        let home = Path::new("/Users/test");
+
+        assert_eq!(
+            expand_home_from(Path::new("~/Downloads/authenticator.png"), home),
+            Path::new("/Users/test/Downloads/authenticator.png")
+        );
+        assert_eq!(
+            expand_home_from(Path::new("~other/authenticator.png"), home),
+            Path::new("~other/authenticator.png")
+        );
     }
 }

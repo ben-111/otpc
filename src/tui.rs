@@ -1,4 +1,4 @@
-use crate::{credentials_from_source, write_config, Config, Credential};
+use crate::{credentials_from_source, expand_home, write_config, Config, Credential};
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
@@ -9,7 +9,9 @@ use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use keyring::Entry;
+use std::fs;
 use std::io::{self, Stdout, Write};
+use std::path::Path;
 use std::time::Duration;
 use totp_rs::TOTP;
 use tui_input::backend::crossterm::EventHandler;
@@ -31,9 +33,22 @@ struct App {
     scroll: usize,
     mode: Mode,
     message: Option<String>,
+    path_completion: Option<PathCompletion>,
 }
 
 struct TerminalSession;
+
+#[derive(Clone)]
+struct PathCompletion {
+    candidates: Vec<CompletionCandidate>,
+    index: usize,
+}
+
+#[derive(Clone)]
+struct CompletionCandidate {
+    value: String,
+    cursor: usize,
+}
 
 impl App {
     fn new(config: Config) -> Self {
@@ -43,6 +58,7 @@ impl App {
             scroll: 0,
             mode: Mode::Normal,
             message: None,
+            path_completion: None,
         }
     }
 
@@ -143,6 +159,110 @@ fn draw_input(
         )?;
     }
     Ok(())
+}
+
+fn path_completion_candidates(input: &Input) -> Result<Vec<CompletionCandidate>> {
+    let cursor_byte = input
+        .value()
+        .char_indices()
+        .nth(input.cursor())
+        .map_or(input.value().len(), |(index, _)| index);
+    let (before_cursor, after_cursor) = input.value().split_at(cursor_byte);
+    if before_cursor.starts_with("otpauth://") || before_cursor.starts_with("otpauth-migration://")
+    {
+        return Ok(Vec::new());
+    }
+
+    let separator = std::path::MAIN_SEPARATOR;
+    let (directory, prefix, base) = if before_cursor.is_empty() {
+        (Path::new("."), "", "")
+    } else if before_cursor.ends_with(separator) {
+        (Path::new(before_cursor), "", before_cursor)
+    } else {
+        let path = Path::new(before_cursor);
+        let prefix = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let base = &before_cursor[..before_cursor.len().saturating_sub(prefix.len())];
+        (directory, prefix, base)
+    };
+
+    let directory = expand_home(directory)?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read directory {}", directory.display()));
+        }
+    };
+    let include_hidden = prefix.starts_with('.');
+    let mut candidates = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(prefix) || (!include_hidden && name.starts_with('.')) {
+                return None;
+            }
+            let directory_suffix = if entry.path().is_dir() {
+                separator.to_string()
+            } else {
+                String::new()
+            };
+            let completed_prefix = format!("{base}{name}{directory_suffix}");
+            Some(CompletionCandidate {
+                cursor: completed_prefix.chars().count(),
+                value: format!("{completed_prefix}{after_cursor}"),
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.value.cmp(&right.value));
+    Ok(candidates)
+}
+
+fn cycle_path_completion(
+    input: &mut Input,
+    completion: &mut Option<PathCompletion>,
+    backwards: bool,
+) -> Result<Option<String>> {
+    let descend_into_only_match = completion.as_ref().is_some_and(|state| {
+        state.candidates.len() == 1
+            && input.value() == state.candidates[0].value
+            && input.cursor() == state.candidates[0].cursor
+            && input.cursor() == input.value().chars().count()
+            && input.value().ends_with(std::path::MAIN_SEPARATOR)
+    });
+
+    if completion.is_none() || descend_into_only_match {
+        let candidates = path_completion_candidates(input)?;
+        if candidates.is_empty() {
+            *completion = None;
+            return Ok(None);
+        }
+        let index = if backwards { candidates.len() - 1 } else { 0 };
+        *input = Input::new(candidates[index].value.clone()).with_cursor(candidates[index].cursor);
+        *completion = Some(PathCompletion { candidates, index });
+    } else if let Some(state) = completion {
+        state.index = if backwards {
+            state
+                .index
+                .checked_sub(1)
+                .unwrap_or(state.candidates.len() - 1)
+        } else {
+            (state.index + 1) % state.candidates.len()
+        };
+        let candidate = &state.candidates[state.index];
+        *input = Input::new(candidate.value.clone()).with_cursor(candidate.cursor);
+    }
+
+    Ok(completion
+        .as_ref()
+        .map(|state| format!("Path match {}/{}", state.index + 1, state.candidates.len())))
 }
 
 fn credential_code(credential: &Credential) -> String {
@@ -297,6 +417,7 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
             KeyCode::Char('n') => {
                 app.mode = Mode::Add(Input::default());
                 app.message = None;
+                app.path_completion = None;
             }
             KeyCode::Down | KeyCode::Char('j')
                 if app.selected + 1 < app.config.credentials.len() =>
@@ -367,6 +488,18 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
                 app.message = None;
+                app.path_completion = None;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let backwards = key.code == KeyCode::BackTab;
+                match cycle_path_completion(&mut input, &mut app.path_completion, backwards) {
+                    Ok(Some(message)) => app.message = Some(message),
+                    Ok(None) => app.message = Some("No path matches".to_owned()),
+                    Err(error) => {
+                        app.message = Some(format!("Path completion failed: {error:#}"));
+                    }
+                }
+                app.mode = Mode::Add(input);
             }
             KeyCode::Enter => {
                 let source = input.value().trim().to_owned();
@@ -387,6 +520,7 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
                                         format!("Added {count} credential(s)"),
                                     ) {
                                         app.mode = Mode::Normal;
+                                        app.path_completion = None;
                                     } else {
                                         app.mode = Mode::Add(input);
                                     }
@@ -407,6 +541,8 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
             _ => {
                 input.handle_event(&Event::Key(key));
                 app.mode = Mode::Add(input);
+                app.message = None;
+                app.path_completion = None;
             }
         },
     }
@@ -423,6 +559,7 @@ fn handle_event(app: &mut App, entry: &Entry, event: Event) -> bool {
                     for character in text.trim().chars() {
                         input.handle(InputRequest::InsertChar(character));
                     }
+                    app.path_completion = None;
                 }
                 _ => {}
             }
@@ -445,5 +582,44 @@ pub(crate) fn run(entry: &Entry, config: Config) -> Result<()> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completes_and_cycles_path_matches() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mut input = Input::new(format!("{manifest_dir}/Cargo."));
+        let mut completion = None;
+
+        let message = cycle_path_completion(&mut input, &mut completion, false).unwrap();
+
+        assert!(message.is_some());
+        assert_eq!(input.value(), format!("{manifest_dir}/Cargo.lock"));
+
+        cycle_path_completion(&mut input, &mut completion, false).unwrap();
+        assert_eq!(input.value(), format!("{manifest_dir}/Cargo.toml"));
+
+        cycle_path_completion(&mut input, &mut completion, false).unwrap();
+        assert_eq!(input.value(), format!("{manifest_dir}/Cargo.lock"));
+    }
+
+    #[test]
+    fn completes_at_the_cursor_without_discarding_the_suffix() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let prefix = format!("{manifest_dir}/Cargo.");
+        let mut input = Input::new(format!("{prefix}suffix")).with_cursor(prefix.chars().count());
+        let mut completion = None;
+
+        cycle_path_completion(&mut input, &mut completion, false).unwrap();
+
+        assert_eq!(input.value(), format!("{manifest_dir}/Cargo.locksuffix"));
+        assert_eq!(
+            input.cursor(),
+            format!("{manifest_dir}/Cargo.lock").chars().count()
+        );
     }
 }
