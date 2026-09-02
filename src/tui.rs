@@ -12,6 +12,8 @@ use keyring::Entry;
 use std::io::{self, Stdout, Write};
 use std::time::Duration;
 use totp_rs::TOTP;
+use tui_input::backend::crossterm::EventHandler;
+use tui_input::{Input, InputRequest};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -19,8 +21,8 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 enum Mode {
     Normal,
     ConfirmDelete,
-    Rename(String),
-    Add(String),
+    Rename(Input),
+    Add(Input),
 }
 
 struct App {
@@ -108,18 +110,39 @@ fn fit_line(text: &str, width: u16) -> String {
     line
 }
 
-fn input_line(prefix: &str, input: &str, width: u16) -> (String, u16) {
-    let available = (width as usize).saturating_sub(prefix.chars().count() + 1);
-    let safe_input = safe_text(input);
-    let input_length = safe_input.chars().count();
-    let visible_input = safe_input
-        .chars()
-        .skip(input_length.saturating_sub(available))
-        .collect::<String>();
-    let line = fit_line(&format!("{prefix}{visible_input}"), width);
-    let cursor = (prefix.chars().count() + visible_input.chars().count())
-        .min(width.saturating_sub(1) as usize) as u16;
-    (line, cursor)
+fn draw_input(
+    stdout: &mut Stdout,
+    row: u16,
+    width: u16,
+    prefix: &str,
+    input: &Input,
+) -> Result<()> {
+    let prefix = safe_text(prefix);
+    let prefix_width = prefix.chars().count().min(width as usize) as u16;
+    queue!(
+        stdout,
+        MoveTo(0, row),
+        SetAttribute(Attribute::Bold),
+        Print(
+            prefix
+                .chars()
+                .take(prefix_width as usize)
+                .collect::<String>()
+        ),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    let input_width = width.saturating_sub(prefix_width);
+    if input_width > 0 {
+        tui_input::backend::crossterm::write(
+            stdout,
+            input.value(),
+            input.cursor(),
+            (prefix_width, row),
+            input_width,
+        )?;
+    }
+    Ok(())
 }
 
 fn credential_code(credential: &Credential) -> String {
@@ -203,7 +226,7 @@ fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
     }
 
     let footer_row = height - 1;
-    let (footer, cursor) = match &app.mode {
+    let footer = match &app.mode {
         Mode::Normal => {
             let options = if app.selected().is_some() {
                 "d delete | r rename"
@@ -215,40 +238,34 @@ fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
                 Some(message) => message.clone(),
                 None => options.to_owned(),
             };
-            (fit_line(&footer, width), None)
+            Some(fit_line(&footer, width))
         }
         Mode::ConfirmDelete => {
             let target = app
                 .selected()
                 .map(|credential| format!("{}: {}", credential.issuer, credential.name))
                 .unwrap_or_default();
-            (fit_line(&format!("Delete {target}? (y/n)"), width), None)
+            Some(fit_line(&format!("Delete {target}? (y/n)"), width))
         }
         Mode::Rename(input) => {
-            let (line, column) = input_line("Rename: ", input, width);
-            (line, Some(column))
+            draw_input(stdout, footer_row, width, "Rename: ", input)?;
+            None
         }
         Mode::Add(input) => {
-            let (line, column) = input_line("Add URL or image path: ", input, width);
-            (line, Some(column))
+            draw_input(stdout, footer_row, width, "Add URL or image path: ", input)?;
+            None
         }
     };
-    queue!(
-        stdout,
-        MoveTo(0, footer_row),
-        SetAttribute(Attribute::Bold),
-        Print(footer),
-        SetAttribute(Attribute::Reset)
-    )?;
-    if let Some(column) = cursor {
-        queue!(stdout, MoveTo(column, footer_row), Show)?;
+    if let Some(footer) = footer {
+        queue!(
+            stdout,
+            MoveTo(0, footer_row),
+            SetAttribute(Attribute::Bold),
+            Print(footer),
+            SetAttribute(Attribute::Reset)
+        )?;
     }
     stdout.flush().context("Failed to draw terminal UI")
-}
-
-fn is_text_key(key: &KeyEvent) -> bool {
-    !key.modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn save_or_restore(app: &mut App, entry: &Entry, previous: Config, success: String) -> bool {
@@ -267,7 +284,7 @@ fn save_or_restore(app: &mut App, entry: &Entry, previous: Config, success: Stri
 }
 
 fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
-    if key.kind != KeyEventKind::Press {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return true;
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -278,7 +295,7 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
         Mode::Normal => match key.code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('n') => {
-                app.mode = Mode::Add(String::new());
+                app.mode = Mode::Add(Input::default());
                 app.message = None;
             }
             KeyCode::Down | KeyCode::Char('j')
@@ -295,7 +312,7 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
             }
             KeyCode::Char('r') => {
                 if let Some(credential) = app.selected() {
-                    app.mode = Mode::Rename(credential.name.clone());
+                    app.mode = Mode::Rename(Input::new(credential.name.clone()));
                     app.message = None;
                 }
             }
@@ -326,18 +343,14 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
                 app.mode = Mode::Normal;
                 app.message = None;
             }
-            KeyCode::Backspace => {
-                input.pop();
-                app.mode = Mode::Rename(input);
-            }
             KeyCode::Enter => {
-                let name = input.trim();
+                let name = input.value().trim().to_owned();
                 if name.is_empty() {
                     app.message = Some("Display name cannot be empty".to_owned());
                     app.mode = Mode::Rename(input);
                 } else if app.selected().is_some() {
                     let previous = app.config.clone();
-                    app.config.credentials[app.selected].name = name.to_owned();
+                    app.config.credentials[app.selected].name = name;
                     if save_or_restore(app, entry, previous, "Credential renamed".to_owned()) {
                         app.mode = Mode::Normal;
                     } else {
@@ -345,28 +358,23 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
                     }
                 }
             }
-            KeyCode::Char(character) if is_text_key(&key) => {
-                input.push(character);
+            _ => {
+                input.handle_event(&Event::Key(key));
                 app.mode = Mode::Rename(input);
             }
-            _ => {}
         },
         Mode::Add(mut input) => match key.code {
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
                 app.message = None;
             }
-            KeyCode::Backspace => {
-                input.pop();
-                app.mode = Mode::Add(input);
-            }
             KeyCode::Enter => {
-                let source = input.trim();
+                let source = input.value().trim().to_owned();
                 if source.is_empty() {
                     app.message = Some("Enter a URL or image path".to_owned());
                     app.mode = Mode::Add(input);
                 } else {
-                    match credentials_from_source(source) {
+                    match credentials_from_source(&source) {
                         Ok(credentials) => {
                             let previous = app.config.clone();
                             match app.config.add(credentials) {
@@ -396,11 +404,10 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
                     }
                 }
             }
-            KeyCode::Char(character) if is_text_key(&key) => {
-                input.push(character);
+            _ => {
+                input.handle_event(&Event::Key(key));
                 app.mode = Mode::Add(input);
             }
-            _ => {}
         },
     }
 
@@ -412,7 +419,11 @@ fn handle_event(app: &mut App, entry: &Entry, event: Event) -> bool {
         Event::Key(key) => handle_key(app, entry, key),
         Event::Paste(text) => {
             match &mut app.mode {
-                Mode::Rename(input) | Mode::Add(input) => input.push_str(text.trim()),
+                Mode::Rename(input) | Mode::Add(input) => {
+                    for character in text.trim().chars() {
+                        input.handle(InputRequest::InsertChar(character));
+                    }
+                }
                 _ => {}
             }
             true
