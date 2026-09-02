@@ -1,4 +1,7 @@
-use crate::{credentials_from_source, expand_home, write_config, Config, Credential};
+use crate::{
+    credentials_from_screenshot, credentials_from_source, expand_home, write_config, Config,
+    Credential,
+};
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
@@ -13,7 +16,7 @@ use std::fs;
 use std::io::{self, Stdout, Write};
 use std::path::Path;
 use std::time::Duration;
-use totp_rs::TOTP;
+use totp_rs::Totp;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::{Input, InputRequest};
 
@@ -266,11 +269,8 @@ fn cycle_path_completion(
 }
 
 fn credential_code(credential: &Credential) -> String {
-    match TOTP::from_url_unchecked(&credential.url) {
-        Ok(totp) => match (totp.generate_current(), totp.ttl()) {
-            (Ok(code), Ok(ttl)) => format!("{code} TTL: {ttl}s"),
-            _ => "Unable to generate code".to_owned(),
-        },
+    match Totp::from_url_unchecked(&credential.url) {
+        Ok(totp) => format!("{} TTL: {}s", totp.generate_current(), totp.ttl()),
         Err(_) => "Invalid credential URL".to_owned(),
     }
 }
@@ -284,8 +284,8 @@ fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
     }
 
     let header = match (&app.mode, &app.message) {
-        (Mode::Normal, _) | (_, None) => "OTPC | q quit | n add".to_owned(),
-        (_, Some(message)) => format!("OTPC | q quit | n add | {message}"),
+        (Mode::Normal, _) | (_, None) => "OTPC | q quit | n add | s scan screen".to_owned(),
+        (_, Some(message)) => format!("OTPC | q quit | n add | s scan screen | {message}"),
     };
     queue!(
         stdout,
@@ -412,6 +412,20 @@ fn save_or_restore(app: &mut App, entry: &Entry, previous: Config, success: Stri
     }
 }
 
+fn add_credentials(app: &mut App, entry: &Entry, credentials: Vec<crate::NewCredential>) -> bool {
+    let previous = app.config.clone();
+    match app.config.add(credentials) {
+        Ok(count) => {
+            app.selected = app.config.credentials.len() - 1;
+            save_or_restore(app, entry, previous, format!("Added {count} credential(s)"))
+        }
+        Err(error) => {
+            app.message = Some(error.to_string());
+            false
+        }
+    }
+}
+
 fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return true;
@@ -428,6 +442,14 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
                 app.message = None;
                 app.path_completion = None;
             }
+            KeyCode::Char('s') => match credentials_from_screenshot() {
+                Ok(credentials) => {
+                    add_credentials(app, entry, credentials);
+                }
+                Err(error) => {
+                    app.message = Some(format!("Screen scan failed: {error:#}"));
+                }
+            },
             KeyCode::Down | KeyCode::Char('j')
                 if app.selected + 1 < app.config.credentials.len() =>
             {
@@ -518,26 +540,11 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
                 } else {
                     match credentials_from_source(&source) {
                         Ok(credentials) => {
-                            let previous = app.config.clone();
-                            match app.config.add(credentials) {
-                                Ok(count) => {
-                                    app.selected = app.config.credentials.len() - 1;
-                                    if save_or_restore(
-                                        app,
-                                        entry,
-                                        previous,
-                                        format!("Added {count} credential(s)"),
-                                    ) {
-                                        app.mode = Mode::Normal;
-                                        app.path_completion = None;
-                                    } else {
-                                        app.mode = Mode::Add(input);
-                                    }
-                                }
-                                Err(error) => {
-                                    app.message = Some(error.to_string());
-                                    app.mode = Mode::Add(input);
-                                }
+                            if add_credentials(app, entry, credentials) {
+                                app.mode = Mode::Normal;
+                                app.path_completion = None;
+                            } else {
+                                app.mode = Mode::Add(input);
                             }
                         }
                         Err(error) => {

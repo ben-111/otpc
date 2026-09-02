@@ -5,7 +5,7 @@ use google_authenticator_converter::{self, Account};
 use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use totp_rs::TOTP;
+use totp_rs::Totp;
 
 const KEYRING_SERVICE: &str = "otpc";
 const KEYRING_USER: &str = "totp-secrets";
@@ -113,15 +113,18 @@ fn credentials_from_url(url: &str) -> Result<Vec<NewCredential>> {
             .collect();
     }
 
-    let totp = TOTP::from_url_unchecked(url).context("Error parsing otpauth URL")?;
-    let issuer = totp.issuer.context("TOTP URL is missing an issuer")?;
-    if totp.account_name.is_empty() {
+    let totp = Totp::from_url_unchecked(url).context("Error parsing otpauth URL")?;
+    let issuer = totp
+        .issuer()
+        .context("TOTP URL is missing an issuer")?
+        .to_owned();
+    if totp.account_name().is_empty() {
         anyhow::bail!("TOTP URL is missing an account name");
     }
 
     Ok(vec![NewCredential {
         issuer,
-        name: totp.account_name,
+        name: totp.account_name().to_owned(),
         url: url.to_owned(),
     }])
 }
@@ -141,7 +144,7 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
     if path.strip_prefix("~").is_err() {
         return Ok(path.to_owned());
     }
-    let home = homedir::get_my_home()
+    let home = homedir::my_home()
         .context("Failed to determine home directory")?
         .context("Home directory not found")?;
     Ok(expand_home_from(path, &home))
@@ -161,6 +164,36 @@ fn credentials_from_source(source: &str) -> Result<Vec<NewCredential>> {
     };
 
     credentials_from_url(&url)
+}
+
+fn credentials_from_screenshot() -> Result<Vec<NewCredential>> {
+    let monitors = xcap::Monitor::all().context("Failed to enumerate displays")?;
+    if monitors.is_empty() {
+        anyhow::bail!("No displays found");
+    }
+
+    let mut invalid_payload = None;
+    for monitor in monitors {
+        let screenshot = monitor
+            .capture_image()
+            .context("Failed to capture display; screen-recording permission may be required")?;
+        let screenshot = xcap::image::DynamicImage::ImageRgba8(screenshot);
+        let Ok(result) =
+            rxing::helpers::detect_in_image(screenshot, Some(rxing::BarcodeFormat::QR_CODE))
+        else {
+            continue;
+        };
+
+        match credentials_from_url(result.getText().trim()) {
+            Ok(credentials) => return Ok(credentials),
+            Err(error) => invalid_payload = Some(error),
+        }
+    }
+
+    match invalid_payload {
+        Some(error) => Err(error).context("Screen QR code does not contain a valid OTP URL"),
+        None => anyhow::bail!("No QR code found on any display"),
+    }
 }
 
 fn main() -> Result<()> {
