@@ -23,13 +23,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Add a TOTP secret
+    /// Add TOTP secrets from an otpauth or otpauth-migration URL
     Add {
-        /// Name of the TOTP secret
-        name: String,
-
-        /// The secret as an otpauth URL
-        secret: String,
+        /// An otpauth or otpauth-migration URL
+        url: String,
     },
 
     /// List all TOTP secrets
@@ -39,12 +36,6 @@ enum Commands {
     Get {
         /// Name of the TOTP secret
         name: String,
-    },
-
-    /// Import TOTP secrets from Google Authenticator
-    Import {
-        /// otpauth-migration URL
-        url: String,
     },
 
     /// Delete TOTP secret
@@ -95,6 +86,39 @@ fn add_secret(config: &mut Config, name: &str, secret: &str) -> Result<bool> {
     Ok(true)
 }
 
+fn secrets_from_url(url: &str) -> Result<Vec<(String, String)>> {
+    if url.starts_with("otpauth-migration://") {
+        let accounts = google_authenticator_converter::process_data(url)
+            .map_err(|_| anyhow::anyhow!("Error parsing otpauth-migration URL"))?;
+
+        return accounts
+            .into_iter()
+            .map(|account| {
+                if account.issuer.is_empty() {
+                    anyhow::bail!("TOTP account is missing an issuer");
+                }
+
+                let url = account_to_otpauth_url(&account);
+                Ok((account.issuer, url))
+            })
+            .collect();
+    }
+
+    let totp = TOTP::from_url_unchecked(url).context("Error parsing otpauth URL")?;
+    let issuer = totp.issuer.context("TOTP URL is missing an issuer")?;
+    Ok(vec![(issuer, url.to_owned())])
+}
+
+fn add_from_url(config: &mut Config, url: &str) -> Result<bool> {
+    let mut config_changed = false;
+
+    for (issuer, secret) in secrets_from_url(url)? {
+        config_changed |= add_secret(config, &issuer, &secret)?;
+    }
+
+    Ok(config_changed)
+}
+
 fn list_secrets(config: &Config) {
     config
         .secrets
@@ -126,18 +150,6 @@ fn account_to_otpauth_url(account: &Account) -> String {
     )
 }
 
-fn import_from_google_auth(config: &mut Config, migration_url: &str) -> Result<()> {
-    let accounts = google_authenticator_converter::process_data(migration_url)
-        .map_err(|_| anyhow::anyhow!("Error parsing migration URL"))?;
-
-    for account in accounts {
-        let secret = account_to_otpauth_url(&account);
-        add_otpauth_to_config(config, &account.issuer, &secret);
-    }
-
-    Ok(())
-}
-
 fn delete_secret(config: &mut Config, name: &str) -> Result<()> {
     config.secrets.remove(name).context("Secret not found")?;
     Ok(())
@@ -150,16 +162,12 @@ fn main() -> Result<()> {
     let mut config = read_config(&entry)?;
 
     let config_changed = match &args.command {
-        Commands::Add { name, secret } => add_secret(&mut config, name, secret)?,
+        Commands::Add { url } => add_from_url(&mut config, url)?,
         Commands::List => {
             list_secrets(&config);
             false
         }
         Commands::Get { name } => return get_totp(&config, name),
-        Commands::Import { url } => {
-            import_from_google_auth(&mut config, url)?;
-            true
-        }
         Commands::Delete { name } => {
             delete_secret(&mut config, name)?;
             true
