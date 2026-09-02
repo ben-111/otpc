@@ -160,7 +160,7 @@ fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
                 Ok(decrypted) => {
                     let secret = String::from_utf8(decrypted).unwrap();
 
-                    match TOTP::from_url(secret) {
+                    match TOTP::from_url_unchecked(secret) {
                         Ok(totp) => loop {
                             print!(
                                 "\x1b[2K\r{} TTL: {}",
