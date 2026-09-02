@@ -1,40 +1,16 @@
-use base64::{engine::general_purpose, Engine as _};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use google_authenticator_converter::{self, Account};
+use itertools::Itertools;
+use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
-use simple_crypt::{decrypt, encrypt};
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::time;
 use totp_rs::TOTP;
 
-use itertools::Itertools;
-use std::io::Write;
-use std::{collections::HashMap, error::Error, path::PathBuf};
-
-use std::{fmt, io, time};
-
-#[derive(Debug)]
-struct OTPCError {
-    details: String,
-}
-
-impl OTPCError {
-    fn new(msg: &str) -> OTPCError {
-        OTPCError {
-            details: msg.to_string(),
-        }
-    }
-}
-
-impl fmt::Display for OTPCError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.details)
-    }
-}
-
-impl Error for OTPCError {
-    fn description(&self) -> &str {
-        &self.details
-    }
-}
+const KEYRING_SERVICE: &str = "otpc";
+const KEYRING_USER: &str = "totp-secrets";
 
 /// Simple TOTP client
 #[derive(Parser)]
@@ -78,108 +54,68 @@ enum Commands {
     },
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 struct Config {
     secrets: HashMap<String, String>,
 }
 
-fn get_config_path() -> PathBuf {
-    let homedir = homedir::get_my_home().unwrap().unwrap();
-    let appdir = homedir.as_path().join(".otpc");
-    if std::fs::metadata(&appdir).is_err() {
-        std::fs::create_dir(&appdir).expect("Failed creating .otpc directory: {}");
+fn read_config(entry: &Entry) -> Result<Config> {
+    match entry.get_secret() {
+        Ok(raw_config) => {
+            serde_json::from_slice(&raw_config).context("Failed to parse config from keyring")
+        }
+        Err(KeyringError::NoEntry) => Ok(Config::default()),
+        Err(error) => Err(error).context("Failed to read config from keyring"),
     }
-
-    appdir.join("config.json")
 }
 
-fn read_config() -> Config {
-    let config_file = get_config_path();
-    if std::fs::metadata(&config_file).is_err() {
-        return Config {
-            secrets: HashMap::new(),
-        };
-    }
-
-    let config: Config =
-        serde_json::from_reader(std::fs::File::open(&config_file).unwrap()).unwrap();
-    config
+fn write_config(entry: &Entry, config: &Config) -> Result<()> {
+    let raw_config = serde_json::to_vec(config).context("Failed to serialize config")?;
+    entry
+        .set_secret(&raw_config)
+        .context("Failed to save config to keyring")
 }
 
-fn write_config(config: &Config) {
-    let config_file = get_config_path();
-    serde_json::to_writer(std::fs::File::create(config_file).unwrap(), config).unwrap();
+fn add_otpauth_to_config(config: &mut Config, name: &str, secret: &str) {
+    config.secrets.insert(name.to_owned(), secret.to_owned());
 }
 
-fn get_password() -> String {
-    dialoguer::Password::new()
-        .with_prompt("Enter password")
-        .interact()
-        .unwrap()
-}
-
-fn add_otpauth_to_config(config: &mut Config, name: &str, secret: &String, password: &String) {
-    let encrypted_bytes = encrypt(secret.as_bytes(), password.as_bytes()).unwrap();
-    let encoded_secret = general_purpose::STANDARD.encode(&encrypted_bytes);
-
-    config.secrets.insert(name.to_owned(), encoded_secret);
-}
-
-fn add_secret(config: &mut Config, name: &String, secret: &String) -> Result<(), OTPCError> {
-    println!("Adding secret {:?} to entry {}", secret, name);
+fn add_secret(config: &mut Config, name: &str, secret: &str) -> Result<bool> {
     if config.secrets.contains_key(name) {
         let overwrite = dialoguer::Confirm::new()
             .with_prompt("A secret exists with that name. Overwrite?")
             .interact()
-            .unwrap();
+            .context("Failed to read confirmation")?;
         if !overwrite {
-            return Ok(());
+            return Ok(false);
         }
     }
-    let password = get_password();
-    add_otpauth_to_config(config, name, secret, &password);
-    write_config(config);
-    Ok(())
+
+    add_otpauth_to_config(config, name, secret);
+    Ok(true)
 }
 
-fn list_secrets(config: &Config) -> Result<(), OTPCError> {
+fn list_secrets(config: &Config) {
     config
         .secrets
         .keys()
         .sorted()
         .for_each(|name| println!("{}", name));
-    Ok(())
 }
 
-fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
-    match config.secrets.get(name) {
-        Some(secret) => {
-            let decoded = general_purpose::STANDARD.decode(secret).unwrap();
-            let password = get_password();
-            match decrypt(&decoded, password.as_bytes()) {
-                Ok(decrypted) => {
-                    let secret = String::from_utf8(decrypted).unwrap();
+fn get_totp(config: &Config, name: &str) -> Result<()> {
+    let secret = config.secrets.get(name).context("Secret not found")?;
+    let totp = TOTP::from_url_unchecked(secret).context("Error generating TOTP code")?;
 
-                    match TOTP::from_url_unchecked(secret) {
-                        Ok(totp) => loop {
-                            print!(
-                                "\x1b[2K\r{} TTL: {}",
-                                totp.generate_current().unwrap(),
-                                totp.ttl().unwrap()
-                            );
-                            io::stdout().flush().unwrap();
-                            std::thread::sleep(time::Duration::from_secs_f32(1.0));
-                        },
-                        Err(e) => Err(OTPCError::new(&format!(
-                            "Error generating TOTP code: {}",
-                            e,
-                        ))),
-                    }
-                }
-                Err(_) => Err(OTPCError::new("Wrong password")),
-            }
-        }
-        None => Err(OTPCError::new("Secret not found")),
+    loop {
+        print!(
+            "\x1b[2K\r{} TTL: {}",
+            totp.generate_current()
+                .context("Failed to generate TOTP code")?,
+            totp.ttl().context("Failed to calculate TOTP TTL")?
+        );
+        io::stdout().flush().context("Failed to write TOTP code")?;
+        std::thread::sleep(time::Duration::from_secs(1));
     }
 }
 
@@ -190,41 +126,49 @@ fn account_to_otpauth_url(account: &Account) -> String {
     )
 }
 
-fn import_from_google_auth(config: &mut Config, migration_url: &str) -> Result<(), OTPCError> {
-    match google_authenticator_converter::process_data(migration_url) {
-        Ok(accounts) => {
-            let password = get_password();
-            for account in accounts {
-                let secret = account_to_otpauth_url(&account);
-                println!("{}", secret);
-                add_otpauth_to_config(config, &account.issuer, &secret, &password);
-            }
+fn import_from_google_auth(config: &mut Config, migration_url: &str) -> Result<()> {
+    let accounts = google_authenticator_converter::process_data(migration_url)
+        .map_err(|_| anyhow::anyhow!("Error parsing migration URL"))?;
 
-            write_config(config);
-            Ok(())
-        }
-        Err(_) => Err(OTPCError::new("Error parsing migration URL")),
+    for account in accounts {
+        let secret = account_to_otpauth_url(&account);
+        add_otpauth_to_config(config, &account.issuer, &secret);
     }
-}
 
-fn delete_secret(config: &mut Config, name: &str) -> Result<(), OTPCError> {
-    if config.secrets.remove(name).is_none() {
-        return Err(OTPCError::new("Secret not found"));
-    }
-    write_config(config);
     Ok(())
 }
 
-fn main() -> Result<(), OTPCError> {
+fn delete_secret(config: &mut Config, name: &str) -> Result<()> {
+    config.secrets.remove(name).context("Secret not found")?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
     let args = Args::parse();
+    let entry =
+        Entry::new(KEYRING_SERVICE, KEYRING_USER).context("Failed to initialize keyring entry")?;
+    let mut config = read_config(&entry)?;
 
-    let mut config = read_config();
+    let config_changed = match &args.command {
+        Commands::Add { name, secret } => add_secret(&mut config, name, secret)?,
+        Commands::List => {
+            list_secrets(&config);
+            false
+        }
+        Commands::Get { name } => return get_totp(&config, name),
+        Commands::Import { url } => {
+            import_from_google_auth(&mut config, url)?;
+            true
+        }
+        Commands::Delete { name } => {
+            delete_secret(&mut config, name)?;
+            true
+        }
+    };
 
-    match &args.command {
-        Commands::Add { name, secret } => add_secret(&mut config, name, secret),
-        Commands::List => list_secrets(&config),
-        Commands::Get { name } => get_totp(&config, name),
-        Commands::Import { url } => import_from_google_auth(&mut config, url),
-        Commands::Delete { name } => delete_secret(&mut config, name),
+    if config_changed {
+        write_config(&entry, &config)?;
     }
+
+    Ok(())
 }
