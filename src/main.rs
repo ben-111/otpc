@@ -1,230 +1,253 @@
-use base64::{engine::general_purpose, Engine as _};
-use clap::{Parser, Subcommand};
+mod tui;
+
+use anyhow::{Context, Result};
 use google_authenticator_converter::{self, Account};
+use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
-use simple_crypt::{decrypt, encrypt};
-use totp_rs::TOTP;
+use std::path::{Path, PathBuf};
+use totp_rs::Totp;
 
-use itertools::Itertools;
-use std::io::Write;
-use std::{collections::HashMap, error::Error, path::PathBuf};
+const KEYRING_SERVICE: &str = "otpc";
+const KEYRING_USER: &str = "totp-secrets";
+const FIRST_CREDENTIAL_ID: u64 = 1;
 
-use std::{fmt, io, time};
-
-#[derive(Debug)]
-struct OTPCError {
-    details: String,
+#[derive(Clone, Deserialize, Serialize)]
+struct Credential {
+    id: u64,
+    issuer: String,
+    name: String,
+    url: String,
 }
 
-impl OTPCError {
-    fn new(msg: &str) -> OTPCError {
-        OTPCError {
-            details: msg.to_string(),
-        }
-    }
-}
-
-impl fmt::Display for OTPCError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.details)
-    }
-}
-
-impl Error for OTPCError {
-    fn description(&self) -> &str {
-        &self.details
-    }
-}
-
-/// Simple TOTP client
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
-#[command(propagate_version = true)]
-struct Args {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Add a TOTP secret
-    Add {
-        /// Name of the TOTP secret
-        name: String,
-
-        /// The secret as an otpauth URL
-        secret: String,
-    },
-
-    /// List all TOTP secrets
-    List,
-
-    /// Get the current TOTP value of a secret
-    Get {
-        /// Name of the TOTP secret
-        name: String,
-    },
-
-    /// Import TOTP secrets from Google Authenticator
-    Import {
-        /// otpauth-migration URL
-        url: String,
-    },
-
-    /// Delete TOTP secret
-    Delete {
-        /// Name of the TOTP secret
-        name: String,
-    },
-}
-
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Config {
-    secrets: HashMap<String, String>,
+    next_id: u64,
+    credentials: Vec<Credential>,
 }
 
-fn get_config_path() -> PathBuf {
-    let homedir = homedir::get_my_home().unwrap().unwrap();
-    let appdir = homedir.as_path().join(".otpc");
-    if std::fs::metadata(&appdir).is_err() {
-        std::fs::create_dir(&appdir).expect("Failed creating .otpc directory: {}");
-    }
-
-    appdir.join("config.json")
-}
-
-fn read_config() -> Config {
-    let config_file = get_config_path();
-    if std::fs::metadata(&config_file).is_err() {
-        return Config {
-            secrets: HashMap::new(),
-        };
-    }
-
-    let config: Config =
-        serde_json::from_reader(std::fs::File::open(&config_file).unwrap()).unwrap();
-    config
-}
-
-fn write_config(config: &Config) {
-    let config_file = get_config_path();
-    serde_json::to_writer(std::fs::File::create(config_file).unwrap(), config).unwrap();
-}
-
-fn get_password() -> String {
-    dialoguer::Password::new()
-        .with_prompt("Enter password")
-        .interact()
-        .unwrap()
-}
-
-fn add_otpauth_to_config(config: &mut Config, name: &str, secret: &String, password: &String) {
-    let encrypted_bytes = encrypt(secret.as_bytes(), password.as_bytes()).unwrap();
-    let encoded_secret = general_purpose::STANDARD.encode(&encrypted_bytes);
-
-    config.secrets.insert(name.to_owned(), encoded_secret);
-}
-
-fn add_secret(config: &mut Config, name: &String, secret: &String) -> Result<(), OTPCError> {
-    println!("Adding secret {:?} to entry {}", secret, name);
-    if config.secrets.contains_key(name) {
-        let overwrite = dialoguer::Confirm::new()
-            .with_prompt("A secret exists with that name. Overwrite?")
-            .interact()
-            .unwrap();
-        if !overwrite {
-            return Ok(());
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            next_id: FIRST_CREDENTIAL_ID,
+            credentials: Vec::new(),
         }
     }
-    let password = get_password();
-    add_otpauth_to_config(config, name, secret, &password);
-    write_config(config);
-    Ok(())
 }
 
-fn list_secrets(config: &Config) -> Result<(), OTPCError> {
-    config
-        .secrets
-        .keys()
-        .sorted()
-        .for_each(|name| println!("{}", name));
-    Ok(())
+#[derive(Clone)]
+struct NewCredential {
+    issuer: String,
+    name: String,
+    url: String,
 }
 
-fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
-    match config.secrets.get(name) {
-        Some(secret) => {
-            let decoded = general_purpose::STANDARD.decode(secret).unwrap();
-            let password = get_password();
-            match decrypt(&decoded, password.as_bytes()) {
-                Ok(decrypted) => {
-                    let secret = String::from_utf8(decrypted).unwrap();
-
-                    match TOTP::from_url_unchecked(secret) {
-                        Ok(totp) => loop {
-                            print!(
-                                "\x1b[2K\r{} TTL: {}",
-                                totp.generate_current().unwrap(),
-                                totp.ttl().unwrap()
-                            );
-                            io::stdout().flush().unwrap();
-                            std::thread::sleep(time::Duration::from_secs_f32(1.0));
-                        },
-                        Err(e) => Err(OTPCError::new(&format!(
-                            "Error generating TOTP code: {}",
-                            e,
-                        ))),
-                    }
-                }
-                Err(_) => Err(OTPCError::new("Wrong password")),
-            }
+impl Config {
+    fn add(&mut self, credentials: Vec<NewCredential>) -> Result<usize> {
+        if credentials.is_empty() {
+            anyhow::bail!("No credentials found");
         }
-        None => Err(OTPCError::new("Secret not found")),
+
+        let count = credentials.len();
+        let next_id = self
+            .next_id
+            .checked_add(count as u64)
+            .context("Credential ID limit reached")?;
+
+        for (offset, credential) in credentials.into_iter().enumerate() {
+            self.credentials.push(Credential {
+                id: self.next_id + offset as u64,
+                issuer: credential.issuer,
+                name: credential.name,
+                url: credential.url,
+            });
+        }
+        self.next_id = next_id;
+        Ok(count)
     }
+}
+
+fn read_config(entry: &Entry) -> Result<Config> {
+    match entry.get_secret() {
+        Ok(raw_config) => {
+            serde_json::from_slice(&raw_config).context("Failed to parse config from keyring")
+        }
+        Err(KeyringError::NoEntry) => Ok(Config::default()),
+        Err(error) => Err(error).context("Failed to read config from keyring"),
+    }
+}
+
+fn write_config(entry: &Entry, config: &Config) -> Result<()> {
+    let raw_config = serde_json::to_vec(config).context("Failed to serialize config")?;
+    entry
+        .set_secret(&raw_config)
+        .context("Failed to save config to keyring")
 }
 
 fn account_to_otpauth_url(account: &Account) -> String {
+    let issuer = urlencoding::encode(&account.issuer);
+    let name = urlencoding::encode(&account.name);
     format!(
-        "otpauth://totp/{}?secret={}&issuer={}",
-        account.name, account.secret, account.issuer
+        "otpauth://totp/{}:{}?secret={}&issuer={}",
+        issuer, name, account.secret, issuer
     )
 }
 
-fn import_from_google_auth(config: &mut Config, migration_url: &str) -> Result<(), OTPCError> {
-    match google_authenticator_converter::process_data(migration_url) {
-        Ok(accounts) => {
-            let password = get_password();
-            for account in accounts {
-                let secret = account_to_otpauth_url(&account);
-                println!("{}", secret);
-                add_otpauth_to_config(config, &account.issuer, &secret, &password);
-            }
+fn credentials_from_url(url: &str) -> Result<Vec<NewCredential>> {
+    if url.starts_with("otpauth-migration://") {
+        let accounts = google_authenticator_converter::process_data(url)
+            .map_err(|_| anyhow::anyhow!("Error parsing otpauth-migration URL"))?;
 
-            write_config(config);
-            Ok(())
+        return accounts
+            .into_iter()
+            .map(|account| {
+                if account.issuer.is_empty() {
+                    anyhow::bail!("TOTP account is missing an issuer");
+                }
+                let url = account_to_otpauth_url(&account);
+                Ok(NewCredential {
+                    issuer: account.issuer,
+                    name: account.name,
+                    url,
+                })
+            })
+            .collect();
+    }
+
+    let totp = Totp::from_url_unchecked(url).context("Error parsing otpauth URL")?;
+    let issuer = totp
+        .issuer()
+        .context("TOTP URL is missing an issuer")?
+        .to_owned();
+    if totp.account_name().is_empty() {
+        anyhow::bail!("TOTP URL is missing an account name");
+    }
+
+    Ok(vec![NewCredential {
+        issuer,
+        name: totp.account_name().to_owned(),
+        url: url.to_owned(),
+    }])
+}
+
+fn url_from_qr_image(path: &Path) -> Result<String> {
+    let path_string = path
+        .to_str()
+        .with_context(|| format!("Image path is not valid UTF-8: {}", path.display()))?;
+    let result =
+        rxing::helpers::detect_in_file(path_string, Some(rxing::BarcodeFormat::QR_CODE))
+            .with_context(|| format!("Failed to decode QR code in image {}", path.display()))?;
+
+    Ok(result.getText().trim().to_owned())
+}
+
+fn expand_home(path: &Path) -> Result<PathBuf> {
+    if path.strip_prefix("~").is_err() {
+        return Ok(path.to_owned());
+    }
+    let home = homedir::my_home()
+        .context("Failed to determine home directory")?
+        .context("Home directory not found")?;
+    Ok(expand_home_from(path, &home))
+}
+
+fn expand_home_from(path: &Path, home: &Path) -> PathBuf {
+    path.strip_prefix("~")
+        .map(|suffix| home.join(suffix))
+        .unwrap_or_else(|_| path.to_owned())
+}
+
+fn credentials_from_source(source: &str) -> Result<Vec<NewCredential>> {
+    let url = if source.starts_with("otpauth://") || source.starts_with("otpauth-migration://") {
+        source.to_owned()
+    } else {
+        url_from_qr_image(&expand_home(Path::new(source))?)?
+    };
+
+    credentials_from_url(&url)
+}
+
+fn credentials_from_screenshot() -> Result<Vec<NewCredential>> {
+    let monitors = xcap::Monitor::all().context("Failed to enumerate displays")?;
+    if monitors.is_empty() {
+        anyhow::bail!("No displays found");
+    }
+
+    let mut invalid_payload = None;
+    for monitor in monitors {
+        let screenshot = monitor
+            .capture_image()
+            .context("Failed to capture display; screen-recording permission may be required")?;
+        let screenshot = xcap::image::DynamicImage::ImageRgba8(screenshot);
+        let Ok(result) =
+            rxing::helpers::detect_in_image(screenshot, Some(rxing::BarcodeFormat::QR_CODE))
+        else {
+            continue;
+        };
+
+        match credentials_from_url(result.getText().trim()) {
+            Ok(credentials) => return Ok(credentials),
+            Err(error) => invalid_payload = Some(error),
         }
-        Err(_) => Err(OTPCError::new("Error parsing migration URL")),
+    }
+
+    match invalid_payload {
+        Some(error) => Err(error).context("Screen QR code does not contain a valid OTP URL"),
+        None => anyhow::bail!("No QR code found on any display"),
     }
 }
 
-fn delete_secret(config: &mut Config, name: &str) -> Result<(), OTPCError> {
-    if config.secrets.remove(name).is_none() {
-        return Err(OTPCError::new("Secret not found"));
-    }
-    write_config(config);
-    Ok(())
+fn main() -> Result<()> {
+    let entry =
+        Entry::new(KEYRING_SERVICE, KEYRING_USER).context("Failed to initialize keyring entry")?;
+    let config = read_config(&entry)?;
+    tui::run(&entry, config)
 }
 
-fn main() -> Result<(), OTPCError> {
-    let args = Args::parse();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut config = read_config();
+    #[test]
+    fn parses_an_otpauth_credential() {
+        let url = "otpauth://totp/GitHub:user%40example.com?secret=KRSXG5CTMVRXEZLUKN2XAZLSKNSWG4TFOQ&issuer=GitHub";
+        let credentials = credentials_from_url(url).unwrap();
 
-    match &args.command {
-        Commands::Add { name, secret } => add_secret(&mut config, name, secret),
-        Commands::List => list_secrets(&config),
-        Commands::Get { name } => get_totp(&config, name),
-        Commands::Import { url } => import_from_google_auth(&mut config, url),
-        Commands::Delete { name } => delete_secret(&mut config, name),
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].issuer, "GitHub");
+        assert_eq!(credentials[0].name, "user@example.com");
+        assert_eq!(credentials[0].url, url);
+    }
+
+    #[test]
+    fn deleted_ids_are_not_reused() {
+        let mut config = Config {
+            next_id: 4,
+            credentials: Vec::new(),
+        };
+
+        config
+            .add(vec![NewCredential {
+                issuer: "Example".to_owned(),
+                name: "alice".to_owned(),
+                url: "url".to_owned(),
+            }])
+            .unwrap();
+
+        assert_eq!(config.credentials[0].id, 4);
+        assert_eq!(config.next_id, 5);
+    }
+
+    #[test]
+    fn expands_a_leading_tilde_path_component() {
+        let home = Path::new("/Users/test");
+
+        assert_eq!(
+            expand_home_from(Path::new("~/Downloads/authenticator.png"), home),
+            Path::new("/Users/test/Downloads/authenticator.png")
+        );
+        assert_eq!(
+            expand_home_from(Path::new("~other/authenticator.png"), home),
+            Path::new("~other/authenticator.png")
+        );
     }
 }
