@@ -1,10 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Parser, Subcommand};
-use dialoguer;
 use google_authenticator_converter::{self, Account};
-use homedir;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use simple_crypt::{decrypt, encrypt};
 use totp_rs::TOTP;
 
@@ -93,9 +90,7 @@ fn get_config_path() -> PathBuf {
         std::fs::create_dir(&appdir).expect("Failed creating .otpc directory: {}");
     }
 
-    let config_path = appdir.join("config.json");
-
-    return config_path;
+    appdir.join("config.json")
 }
 
 fn read_config() -> Config {
@@ -108,7 +103,7 @@ fn read_config() -> Config {
 
     let config: Config =
         serde_json::from_reader(std::fs::File::open(&config_file).unwrap()).unwrap();
-    return config;
+    config
 }
 
 fn write_config(config: &Config) {
@@ -117,17 +112,17 @@ fn write_config(config: &Config) {
 }
 
 fn get_password() -> String {
-    return dialoguer::Password::new()
+    dialoguer::Password::new()
         .with_prompt("Enter password")
         .interact()
-        .unwrap();
+        .unwrap()
 }
 
-fn add_otpauth_to_config(config: &mut Config, name: &String, secret: &String, password: &String) {
+fn add_otpauth_to_config(config: &mut Config, name: &str, secret: &String, password: &String) {
     let encrypted_bytes = encrypt(secret.as_bytes(), password.as_bytes()).unwrap();
     let encoded_secret = general_purpose::STANDARD.encode(&encrypted_bytes);
 
-    config.secrets.insert(name.clone(), encoded_secret);
+    config.secrets.insert(name.to_owned(), encoded_secret);
 }
 
 fn add_secret(config: &mut Config, name: &String, secret: &String) -> Result<(), OTPCError> {
@@ -143,7 +138,7 @@ fn add_secret(config: &mut Config, name: &String, secret: &String) -> Result<(),
     }
     let password = get_password();
     add_otpauth_to_config(config, name, secret, &password);
-    write_config(&config);
+    write_config(config);
     Ok(())
 }
 
@@ -159,7 +154,7 @@ fn list_secrets(config: &Config) -> Result<(), OTPCError> {
 fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
     match config.secrets.get(name) {
         Some(secret) => {
-            let decoded = general_purpose::STANDARD.decode(&secret).unwrap();
+            let decoded = general_purpose::STANDARD.decode(secret).unwrap();
             let password = get_password();
             match decrypt(&decoded, password.as_bytes()) {
                 Ok(decrypted) => {
@@ -175,32 +170,28 @@ fn get_totp(config: &Config, name: &String) -> Result<(), OTPCError> {
                             io::stdout().flush().unwrap();
                             std::thread::sleep(time::Duration::from_secs_f32(1.0));
                         },
-                        Err(e) => {
-                            return Err(OTPCError::new(&format!(
-                                "Error generating TOTP code: {}",
-                                e.to_string(),
-                            )))
-                        }
+                        Err(e) => Err(OTPCError::new(&format!(
+                            "Error generating TOTP code: {}",
+                            e,
+                        ))),
                     }
                 }
-                Err(_) => return Err(OTPCError::new("Wrong password")),
+                Err(_) => Err(OTPCError::new("Wrong password")),
             }
         }
-        None => {
-            return Err(OTPCError::new("Secret not found"));
-        }
+        None => Err(OTPCError::new("Secret not found")),
     }
 }
 
 fn account_to_otpauth_url(account: &Account) -> String {
-    return format!(
+    format!(
         "otpauth://totp/{}?secret={}&issuer={}",
         account.name, account.secret, account.issuer
-    );
+    )
 }
 
-fn import_from_google_auth(config: &mut Config, migration_url: &String) -> Result<(), OTPCError> {
-    match google_authenticator_converter::process_data(&migration_url) {
+fn import_from_google_auth(config: &mut Config, migration_url: &str) -> Result<(), OTPCError> {
+    match google_authenticator_converter::process_data(migration_url) {
         Ok(accounts) => {
             let password = get_password();
             for account in accounts {
@@ -216,7 +207,7 @@ fn import_from_google_auth(config: &mut Config, migration_url: &String) -> Resul
     }
 }
 
-fn delete_secret(config: &mut Config, name: &String) -> Result<(), OTPCError> {
+fn delete_secret(config: &mut Config, name: &str) -> Result<(), OTPCError> {
     if config.secrets.remove(name).is_none() {
         return Err(OTPCError::new("Secret not found"));
     }
@@ -230,10 +221,10 @@ fn main() -> Result<(), OTPCError> {
     let mut config = read_config();
 
     match &args.command {
-        Commands::Add { name, secret } => return add_secret(&mut config, name, secret),
-        Commands::List => return list_secrets(&config),
-        Commands::Get { name } => return get_totp(&config, &name),
-        Commands::Import { url } => return import_from_google_auth(&mut config, url),
-        Commands::Delete { name } => return delete_secret(&mut config, name),
+        Commands::Add { name, secret } => add_secret(&mut config, name, secret),
+        Commands::List => list_secrets(&config),
+        Commands::Get { name } => get_totp(&config, name),
+        Commands::Import { url } => import_from_google_auth(&mut config, url),
+        Commands::Delete { name } => delete_secret(&mut config, name),
     }
 }
