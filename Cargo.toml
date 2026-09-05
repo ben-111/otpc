@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.104"
+arboard = { version = "3.6.1", default-features = false }
 crossterm = "0.29.0"
 google_authenticator_converter = "0.2.0"
 homedir = "0.3.6"
