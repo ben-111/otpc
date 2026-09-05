@@ -37,6 +37,7 @@ struct App {
     mode: Mode,
     message: Option<String>,
     path_completion: Option<PathCompletion>,
+    clipboard: Option<arboard::Clipboard>,
 }
 
 struct TerminalSession;
@@ -62,6 +63,7 @@ impl App {
             mode: Mode::Normal,
             message: None,
             path_completion: None,
+            clipboard: None,
         }
     }
 
@@ -268,11 +270,28 @@ fn cycle_path_completion(
         .map(|state| format!("Path match {}/{}", state.index + 1, state.candidates.len())))
 }
 
+fn current_code(credential: &Credential) -> Result<(String, u64)> {
+    let totp = Totp::from_url_unchecked(&credential.url).context("Invalid credential URL")?;
+    Ok((totp.generate_current().to_string(), totp.ttl()))
+}
+
 fn credential_code(credential: &Credential) -> String {
-    match Totp::from_url_unchecked(&credential.url) {
-        Ok(totp) => format!("{} TTL: {}s", totp.generate_current(), totp.ttl()),
+    match current_code(credential) {
+        Ok((code, ttl)) => format!("{code} TTL: {ttl}s"),
         Err(_) => "Invalid credential URL".to_owned(),
     }
+}
+
+fn copy_selected_code(app: &mut App) -> Result<()> {
+    let code = current_code(app.selected().context("No credential selected")?)?.0;
+    if app.clipboard.is_none() {
+        app.clipboard = Some(arboard::Clipboard::new().context("Failed to access clipboard")?);
+    }
+    app.clipboard
+        .as_mut()
+        .context("Failed to access clipboard")?
+        .set_text(code)
+        .context("Failed to copy code")
 }
 
 fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
@@ -358,7 +377,7 @@ fn draw(app: &mut App, stdout: &mut Stdout) -> Result<()> {
     let footer = match &app.mode {
         Mode::Normal => {
             let options = if app.selected().is_some() {
-                "d delete | r rename"
+                "[enter] copy | d delete | r rename"
             } else {
                 ""
             };
@@ -449,6 +468,10 @@ fn handle_key(app: &mut App, entry: &Entry, key: KeyEvent) -> bool {
                 Err(error) => {
                     app.message = Some(format!("Screen scan failed: {error:#}"));
                 }
+            },
+            KeyCode::Enter if app.selected().is_some() => match copy_selected_code(app) {
+                Ok(()) => app.message = Some("Code copied".to_owned()),
+                Err(error) => app.message = Some(format!("Copy failed: {error:#}")),
             },
             KeyCode::Down | KeyCode::Char('j')
                 if app.selected + 1 < app.config.credentials.len() =>
